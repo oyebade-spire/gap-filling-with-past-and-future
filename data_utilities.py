@@ -4,21 +4,18 @@ import random, math
 from PIL import Image, ImageFilter
 from keras.utils.data_utils import Sequence
 import copy
-# import cv2
-# import albumentations as A
-# from albumentations import (HorizontalFlip, RandomSizedCrop, RandomResizedCrop, Crop, Blur, 
-#         RandomScale, RandomCrop, RandomBrightnessContrast,  Flip, SmallestMaxSize, Resize, 
-#         RandomRotate90, Normalize, Compose)
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from netCDF4 import Dataset
 from plot_utilities import plotMap_same_scale
-
+from netCDF4 import num2date
+import pandas as pd
 
 from pygnssr.common.utils.Equi7Grid import Equi7Tile
 from pygnssr.common.utils.gdalport import write_tiff
-
 import pygnssr2.experimental.generate_stacks
+
+
 
 def RandomCrop_param(img, scale=(0.08, 1.0), ratio=(3. / 4., 4. / 3.)):
     """Get parameters for ``crop`` for a random sized crop.
@@ -715,9 +712,6 @@ def pix_grd_vld_time(x_grnd_slc, qlty_flg_slc):
     return np.array(pix_grnd_vld)
 
 
-
-
-
 def singleDay_modelTestwithTime(loaded_model, X_test_full, X_test_time, qlty_flg_temp, proc_day=None, lk_fwd = None):
     """ function: test trained model using the index of the given day. Returns the ground-truth for the speicified day,
     ML model gap-filled result and corresponding quality flag   
@@ -1054,12 +1048,78 @@ def static_qlty_flag_mask(qlty_flg):
         bs_slc = np.clip(bs_slc, a_min=0, a_max=1)   #clip array to binary format
     return bs_slc
 
+def broadcast_unique_time(smap_date):
+    """ function: for every measurement, set all pixel values to the maximum pixel value 
+    smap_data: input data to process """
+    data = smap_date.copy()
+    data = np.nan_to_num(data, copy=True, nan= -0.01)         #replace nan with fill value
+    for i in range(len(smap_date)):
+        slc = data[i, :, :]
+        slc_max = np.max(slc)
+        data[i, :, :] = slc_max
+    return data
+
+def get_mask(data, fill_val=-0.01):
+    """ function: returns the data mask based on the specified fill value 
+    data: data to process 
+    fill_val: fill value that determines the masked pixels """
+    dum = np.full_like(data, fill_value=0)
+    dum[data==fill_val] = 1
+    return dum
+
+
+def retrieve_tm_utc(tm):
+    """ function: returns the minimum and maximum acquisition times in 'real datetime' format 
+    tm: netcdf4 time object """
+    tb_time_utc_flat = np.reshape(tm, (tm.shape[0], tm.shape[1]*tm.shape[2]))
+    # Get one value per day (pixels in same image have slightly different sensing times)
+    # dates_smap = np.amax(tb_time_utc_flat, axis=1)
+    # Get dates as datetime
+    dates_smap_max = num2date(np.nanmax(tb_time_utc_flat, axis=1), calendar='gregorian', units = 'seconds since 2014-01-01 00:00:00.0', 
+                            only_use_cftime_datetimes=False, only_use_python_datetimes=True)
+
+    dates_smap_min = num2date(np.nanmin(tb_time_utc_flat, axis=1), calendar='gregorian', units = 'seconds since 2014-01-01 00:00:00.0', 
+                            only_use_cftime_datetimes=False, only_use_python_datetimes=True)
+    
+    dates_smap_max = pd.DataFrame(dates_smap_max)     #first step to convert time to numpy format
+    dates_smap_max = np.array(dates_smap_max) #final step to convert time to numpy format
+
+    dates_smap_min = pd.DataFrame(dates_smap_min)     #first step to convert time to numpy format
+    dates_smap_min = np.array(dates_smap_min) #final step to convert time to numpy format
+    return dates_smap_min, dates_smap_max
+
+
 
 def cal_qflag(time_diff_idx, weights, arr_len):
     weights = weights[0: arr_len]
     res = np.sum(np.array(time_diff_idx) * np.array(weights))/ np.sum(weights)
     res = res * 100
     return res
+
+def time_str_comb(time_min_1d_str, time_max_1d_str):
+    """ function: returns the combine the minimum and maximum time strings into one string
+    time_min_1d_str: minimum time string 
+    time_max_1d_str: maximum time string  """
+
+    t_comb = []
+    for i in range(len(time_min_1d_str)):
+        t_min = time_min_1d_str[i]
+        t_max = time_max_1d_str[i]
+        t_comb +=  [t_min + '_' + t_max]
+    return t_comb
+
+def get_unique_file_names(local_data_root_path, data_folder):
+    """ function: retrieves the unique file names in 'data_folder' of the 'local_data_root_path'
+    local_data_root_path: parent directory to 'data_folder'
+    data_folder: folder where lies the actual data of interest to process """ 
+
+    smap_data_files_lst = os.listdir(local_data_root_path + data_folder)
+    files_names_final = []
+    for file_names in smap_data_files_lst:
+        file_name_extr = file_names[0: 18]      #read portion of interesting
+        if file_name_extr not in files_names_final: #prevent duplicates
+            files_names_final.append(file_name_extr)
+    return files_names_final
 
 
 def comp_pix_qlty(sm, tm, lookback=9, max_num_per_day=2):
@@ -1109,25 +1169,12 @@ def var_len_testModel_fut(loaded_model, full_inp, time_3d_fmt, qlty_flag, static
     LOOK_BACK_TIME_TEST: actual time in the past to collect smap data for testing 
     TIME_FORMAT: time format in 'mins', 'hrs' or 'days' 
     DISP_PLOT: flag for showing plots 
-    SAVE_PLOTS: flag for saving plots """
-
-    gap_filled = np.empty([full_inp.shape[1], 
-                                    full_inp.shape[2]])   #creates an empty
-    gap_filled  = gap_filled[None, :, :]   #adds an extra dimension; for saving external loop results
-
-    ground_dum = np.empty([full_inp.shape[1], 
-                                    full_inp.shape[2]])   #creates an empty
-    ground_dum = ground_dum[None, :, :]   #adds an extra dimension; for saving external loop results 
-
-    qltyFlag_dum = np.empty([full_inp.shape[1], 
-                                    full_inp.shape[2]])   #creates an empty
-    qltyFlag_dum = qltyFlag_dum[None, :, :]   #adds an extra dimension; for saving external loop results     
-
-    pix_qly_2d_dum = np.empty([100, 
-                                    100])   #creates an empty
-    pix_qly_2d_dum = pix_qly_2d_dum[None, :, :]   #adds an extra dimension; for saving external loop results                        
+    SAVE_PLOTS: flag for saving plots """                    
                         
+    gap_filled = []
 
+    pix_qly_2d_dum = []
+    
     time_keep_1d = []
 
     if rot_stack==True:
@@ -1136,8 +1183,8 @@ def var_len_testModel_fut(loaded_model, full_inp, time_3d_fmt, qlty_flag, static
     LOOK_FORWARD_UPD = LOOK_FORWARD + 1     #update so that retrival is correct
     static_flag_cut = static_flag[25: 125, 25: 125]
 
-    # for i in range(0, 25):
-    for i in range(len(full_inp)):
+    for i in range(0, 25):
+    # for i in range(len(full_inp)):
         print('testing sample i:', i)
         smap_var_len, time_curr_1d = data_btwTime_idx(full_inp, time_1d, start_idx=i, lk_bck= LOOK_BACK, 
                             lbk_time = LOOK_BACK_TIME_TEST, lk_fwd = LOOK_FORWARD, lk_fwd_time = LOOK_FORWARD_TIME, 
@@ -1152,10 +1199,6 @@ def var_len_testModel_fut(loaded_model, full_inp, time_3d_fmt, qlty_flag, static
                             lbk_days_fmt = TIME_FORMAT)
         
         measur_len = len(smap_var_len)          #get number of measurements/images retrieved; max will be the look back time steps
-        
-        # print('test_res shape:', smap_var_len.shape)
-        # print('qlty_flag_var_len shape:', qlty_flag_var_len.shape)
-        # print('time_var_len_3d:', time_var_len_3d.shape)
 
         if measur_len == 0:  #if an empty list is returned; data sequence unsuccessful
             smap_var_len = full_inp[i]
@@ -1172,8 +1215,7 @@ def var_len_testModel_fut(loaded_model, full_inp, time_3d_fmt, qlty_flag, static
         smap_var_len_ch = smap_var_len[:, 25: 125, 25: 125] #take 25:125 when smap input is cut 75:175
         time_diff_var_len_ch = time_diff_var_len[:, 25: 125, 25: 125] #take 25:125 when smap input is cut 75:175
         # smap_var_len_ch = smap_var_len[:, 50: 150, 50: 150] #take 50:150 when smap input is cut 50:250
-        # time_diff_var_len_ch = time_diff_var_len[:, 50: 150, 50: 150] #take 50:150 when smap input is cut 50:250
-        pix_qly_2d = comp_pix_qlty(smap_var_len_ch, time_diff_var_len_ch, lookback=9, max_num_per_day=2)                     
+        # time_diff_var_len_ch = time_diff_var_len[:, 50: 150, 50: 150] #take 50:150 when smap input is cut 50:250                    
 
         ######add channels to inputs
         X_test_full = np.expand_dims(smap_var_len, axis=-1) 
@@ -1211,12 +1253,11 @@ def var_len_testModel_fut(loaded_model, full_inp, time_3d_fmt, qlty_flag, static
         
         
         ####stack gap-filled smaps and ground-truth smaps
-        gap_filled = np.concatenate((gap_filled, test_res[None, :, :]), axis=0)
-        # ground_dum = np.concatenate((ground_dum, data_ground[None, :, :]), axis=0)
-        # qltyFlag_dum = np.concatenate((qltyFlag_dum, qlty_flg_temp_slc[None, :, :]), axis=0)
+        gap_filled.append(test_res)
 
-        if comp_pixSeriesQlty == True: 
-            pix_qly_2d_dum = np.concatenate((pix_qly_2d_dum, pix_qly_2d[None, :, :]), axis=0)
+        if comp_pixSeriesQlty == True:
+            pix_qly_2d = comp_pix_qlty(smap_var_len_ch, time_diff_var_len_ch, lookback=9, max_num_per_day=2)
+            pix_qly_2d_dum.append(pix_qly_2d)
 
         ####stack time
         time_keep_1d.append(time_curr_1d)
@@ -1242,188 +1283,17 @@ def var_len_testModel_fut(loaded_model, full_inp, time_3d_fmt, qlty_flag, static
                         sv_path=save_plot_path, sv_idx=i, custom_cmap=plot_cmap, 
                         show_plot= DISP_PLOT, lk_bck_days= LOOK_BACK_TIME_TEST)  #note that the preprocessed gap-filled result is plotted
 
-    gap_filled = gap_filled[1:, :, :]     #slice out array excluding the first dummy at index 0
+    gap_filled = np.stack(gap_filled, axis = 0)
+    # gap_filled = gap_filled[1:, :, :]     #slice out array excluding the first dummy at index 0
     # ground_dum = ground_dum[1:, :, :]     #slice out array excluding the first dummy at index 0
-    # qltyFlag_dum = qltyFlag_dum[1:, :, :]     #slice out array excluding the first dummy at index 0
-    # print('test_res shape:', gap_filled.shape)
-    # print('data_ground shape:', ground_dum.shape)
-    # print('qlty_flg_temp_slc shape:', qltyFlag_dum.shape)
+
     if comp_pixSeriesQlty == True: 
-        pix_qly_2d_dum = pix_qly_2d_dum[1:, :, :]     #slice out array excluding the first dummy at index 0
+        pix_qly_2d_dum = np.stack(pix_qly_2d_dum, axis = 0)
     else:
         pix_qly_2d_dum = []
 
     time_keep_1d = np.array(time_keep_1d)
     return gap_filled, pix_qly_2d_dum
-
-
-
-
-
-# def var_len_testModel_fut(loaded_model, full_inp, time_3d_fmt, qlty_flag, static_flag, time_1d, LOOK_BACK, LOOK_BACK_TIME_TEST, 
-#     TIME_FORMAT, LOOK_FORWARD, LOOK_FORWARD_TIME, rot_stack=True, applyStatFlag= False, time_1d_str_form = None, 
-#     tile_name= None, comp_pixSeriesQlty= True, plot_operations= None, plot_cmap= None, DISP_PLOT= True, SAVE_PLOTS= True, 
-#     save_plot_path= None):
-#     """ function: takes smap and acquistion time, tests the ML model, plot gap-filled results. Returns arrays of 
-#     the predicted outputs and 1d times for every sample tested 
-#     loaded_model: trained ML model to use for testing
-#     full_inp: smap 3d data for testing 
-#     time_3d_fmt: smap times in 3d for testing 
-#     qlty_flag: quality flag in 3d for testing 
-#     time_1d: actual and precise smap acquisition time in 1d array
-#     LOOK_BACK: number of measurements in the past to include in the testing 
-#     LOOK_BACK_TIME_TEST: actual time in the past to collect smap data for testing 
-#     TIME_FORMAT: time format in 'mins', 'hrs' or 'days' 
-#     DISP_PLOT: flag for showing plots 
-#     SAVE_PLOTS: flag for saving plots """
-
-#     gap_filled = np.empty([full_inp.shape[1], 
-#                                     full_inp.shape[2]])   #creates an empty
-#     gap_filled  = gap_filled[None, :, :]   #adds an extra dimension; for saving external loop results
-
-#     ground_dum = np.empty([full_inp.shape[1], 
-#                                     full_inp.shape[2]])   #creates an empty
-#     ground_dum = ground_dum[None, :, :]   #adds an extra dimension; for saving external loop results 
-
-#     qltyFlag_dum = np.empty([full_inp.shape[1], 
-#                                     full_inp.shape[2]])   #creates an empty
-#     qltyFlag_dum = qltyFlag_dum[None, :, :]   #adds an extra dimension; for saving external loop results     
-
-#     pix_qly_2d_dum = np.empty([100, 
-#                                     100])   #creates an empty
-#     pix_qly_2d_dum = pix_qly_2d_dum[None, :, :]   #adds an extra dimension; for saving external loop results                        
-                        
-
-#     time_keep_1d = []
-
-#     if rot_stack==True:
-#         static_flag = rotate_stack(static_flag)
-    
-#     LOOK_FORWARD_UPD = LOOK_FORWARD + 1     #update so that retrival is correct
-#     static_flag_cut = static_flag[25: 125, 25: 125]
-
-#     # for i in range(0, 25):
-#     for i in range(len(full_inp)):
-#         print('testing sample i:', i)
-#         smap_var_len, time_curr_1d = data_btwTime_idx(full_inp, time_1d, start_idx=i, lk_bck= LOOK_BACK, 
-#                             lbk_time = LOOK_BACK_TIME_TEST, lk_fwd = LOOK_FORWARD, lk_fwd_time = LOOK_FORWARD_TIME, 
-#                             lbk_days_fmt = TIME_FORMAT)
-
-#         qlty_flag_var_len, _ = data_btwTime_idx(qlty_flag, time_1d, start_idx=i, lk_bck= LOOK_BACK, 
-#                             lbk_time = LOOK_BACK_TIME_TEST, lk_fwd = LOOK_FORWARD, lk_fwd_time = LOOK_FORWARD_TIME, 
-#                             lbk_days_fmt = TIME_FORMAT)
-
-#         time_var_len_3d, _ = data_btwTime_idx(time_3d_fmt, time_1d, start_idx=i, lk_bck= LOOK_BACK, 
-#                             lbk_time = LOOK_BACK_TIME_TEST, lk_fwd = LOOK_FORWARD, lk_fwd_time = LOOK_FORWARD_TIME, 
-#                             lbk_days_fmt = TIME_FORMAT)
-        
-#         measur_len = len(smap_var_len)          #get number of measurements/images retrieved; max will be the look back time steps
-        
-#         # print('test_res shape:', smap_var_len.shape)
-#         # print('qlty_flag_var_len shape:', qlty_flag_var_len.shape)
-#         # print('time_var_len_3d:', time_var_len_3d.shape)
-
-#         if measur_len != 0:
-#             ###########compute time difference
-#             time_diff_var_len = time_diff(time_var_len_3d, lk_fwd = LOOK_FORWARD)
-
-#             ######normalize time data
-#             time_diff_var_len = time_diff_var_len/LOOK_BACK_TIME_TEST  
-#             # time_diff_var_len = time_diff_var_len/11                   
-
-#             smap_var_len_ch = smap_var_len[:, 25: 125, 25: 125] #take 25:125 when smap input is cut 75:175
-#             time_diff_var_len_ch = time_diff_var_len[:, 25: 125, 25: 125] #take 25:125 when smap input is cut 75:175
-#             # smap_var_len_ch = smap_var_len[:, 50: 150, 50: 150] #take 50:150 when smap input is cut 50:250
-#             # time_diff_var_len_ch = time_diff_var_len[:, 50: 150, 50: 150] #take 50:150 when smap input is cut 50:250
-#             pix_qly_2d = comp_pix_qlty(smap_var_len_ch, time_diff_var_len_ch, lookback=9, max_num_per_day=2)                     
-
-#             ######add channels to inputs
-#             X_test_full = np.expand_dims(smap_var_len, axis=-1) 
-#             X_test_time = np.expand_dims(time_diff_var_len, axis=-1)
-#             qlty_flg_temp = np.expand_dims(qlty_flag_var_len, axis=-1) 
-
-#             # print('X_test_full shape:', X_test_full.shape)
-
-#             ########test trained ml model
-#             if measur_len < (LOOK_BACK + LOOK_FORWARD):     #check that there's suitable number of measurements for testing
-#                 if measur_len < 2:               #check that the current time step measurement can be retrieved
-#                     LOOK_FORWARD_UPD = 1
-#                 data_ground = X_test_full[-LOOK_FORWARD_UPD, :, :, :]   #get a specific current day
-#                 data_ground = np.reshape(data_ground, newshape=(data_ground.shape[0], data_ground.shape[1]))    #reshape to the resolution of sm
-
-#                 test_res = data_ground     #set as ground-truth, since we do no gap-filling
-
-#                 qlty_flg_temp_slc = qlty_flg_temp[-LOOK_FORWARD_UPD, :, :, :]
-#                 qlty_flg_temp_slc = np.reshape(qlty_flg_temp_slc, newshape=(qlty_flg_temp_slc.shape[0], qlty_flg_temp_slc.shape[1]))
-
-#             else:
-#                 data_ground, test_res, qlty_flg_temp_slc = singleDay_modelTestwithTime(loaded_model, 
-#                 X_test_full, X_test_time, qlty_flg_temp, proc_day= i, lk_fwd = LOOK_FORWARD)
-            
-#             if rot_stack== True:
-#                 data_ground = rotate_stack(data_ground, rot_axis= (0, 1))
-#                 test_res = rotate_stack(test_res, rot_axis= (0, 1))
-#                 qlty_flg_temp_slc = rotate_stack(qlty_flg_temp_slc, rot_axis= (0, 1))
-
-
-#             data_ground_cut = data_ground[25: 125, 25: 125]  #take 25:125 when smap input is cut 75:175
-#             test_res_cut = test_res[25: 125, 25: 125]   #take 25:125 when smap input is cut 75:175
-#             qlty_flg_temp_slc_cut = qlty_flg_temp_slc[25: 125, 25: 125]   #take 25:125 when smap input is cut 75:175
-
-            
-            
-#             ####stack gap-filled smaps and ground-truth smaps
-#             gap_filled = np.concatenate((gap_filled, test_res[None, :, :]), axis=0)
-#             # ground_dum = np.concatenate((ground_dum, data_ground[None, :, :]), axis=0)
-#             # qltyFlag_dum = np.concatenate((qltyFlag_dum, qlty_flg_temp_slc[None, :, :]), axis=0)
-
-#             if comp_pixSeriesQlty == True: 
-#                 pix_qly_2d_dum = np.concatenate((pix_qly_2d_dum, pix_qly_2d[None, :, :]), axis=0)
-
-#             ####stack time
-#             time_keep_1d.append(time_curr_1d)
-#             mae_day, rmse_day = mae_rmse_single_day(data_ground_cut, test_res_cut, qlty_flg_temp_slc_cut) #mae on a specific day without checking valid days
-#             if mae_day != np.nan:       #check for days in which the quality flag indicates no valid measurment
-#                 mae_day = np.round(mae_day, decimals=4)
-#                 data_ground_cut_post, test_res_cut_post = post_proc_smap_res(test_res_cut, data_ground_cut, 
-#                                                     qlty_flg_temp_slc_cut)   #apply qlty flags on gap-filled results
-
-#                 if applyStatFlag== True:
-#                     test_res_cut = apply_static_qlty_flag(test_res_cut, static_flag_cut)
-                
-#                 if plot_operations==True:
-#                     if time_1d_str_form !=None:
-#                         fig_name = tile_name + '_' + time_1d_str_form[i]        #put together name for saving plotted figure
-#                         plotMap_same_scale(data_ground_cut, test_res_cut, plot_title='Results: ' + 
-#                                 time_1d_str_form[i] + ' with ' + str(measur_len)+ ' measurements. ' + 'MAE is '+ str(mae_day), sv_plt=SAVE_PLOTS, 
-#                                 sv_path=save_plot_path, sv_idx= fig_name, custom_cmap=plot_cmap, 
-#                                 show_plot= DISP_PLOT, lk_bck_days= LOOK_BACK_TIME_TEST)  #note that the preprocessed gap-filled result is plotted
-#                     else:
-#                         plotMap_same_scale(data_ground_cut_post, test_res_cut, plot_title='Results: ' + 
-#                             str(i) + ' with ' + str(measur_len)+ ' measurements. ' + 'MAE: '+ str(mae_day), sv_plt=SAVE_PLOTS, 
-#                             sv_path=save_plot_path, sv_idx=i, custom_cmap=plot_cmap, 
-#                             show_plot= DISP_PLOT, lk_bck_days= LOOK_BACK_TIME_TEST)  #note that the preprocessed gap-filled result is plotted
-
-#     gap_filled = gap_filled[1:, :, :]     #slice out array excluding the first dummy at index 0
-#     # ground_dum = ground_dum[1:, :, :]     #slice out array excluding the first dummy at index 0
-#     # qltyFlag_dum = qltyFlag_dum[1:, :, :]     #slice out array excluding the first dummy at index 0
-#     # print('test_res shape:', gap_filled.shape)
-#     # print('data_ground shape:', ground_dum.shape)
-#     # print('qlty_flg_temp_slc shape:', qltyFlag_dum.shape)
-#     if comp_pixSeriesQlty == True: 
-#         pix_qly_2d_dum = pix_qly_2d_dum[1:, :, :]     #slice out array excluding the first dummy at index 0
-#     else:
-#         pix_qly_2d_dum = []
-
-#     time_keep_1d = np.array(time_keep_1d)
-#     return gap_filled, pix_qly_2d_dum
-
-
-
-
-
-
-
 
 
 
@@ -1524,20 +1394,6 @@ def var_len_testModel_fut(loaded_model, full_inp, time_3d_fmt, qlty_flag, static
 
 #     time_keep_1d = np.array(time_keep_1d)
 #     return ground_dum, gap_filled, qltyFlag_dum, time_keep_1d
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def rotate_stack(data, rot_axis= None):

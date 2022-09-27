@@ -41,13 +41,12 @@ IMG_INPUT = (IMG_ROWS, IMG_COLS, IMG_CHANNELS)  #input image shape
 NORM_LAYS = True
 LOOK_BACK = 6       #number of measurements/images
 LOOK_FORWARD = 1    #number of measurements/images
+MAX_LOOK_BACK_TIME = 10     #maximum real time in the past from which training data is extracted; values are in 'hrs' or 'days'
+MAX_LOOK_FORWARD_TIME = 2   #maximum real time in the future from which training data is extracted; values are in 'hrs' or 'days'
 MODEL_WIDTH = 1     #multiplicative factor for model filters
 LEAKY_RELU = 0  #leaky factor for leaky relu activation function
 MODEL_CHKPOINT = False  #flag that reflects, whether to checkpoint model
 MODEL_LOSS = 'mae'      #model loss function; values are 'mae' or 'mse
-MAX_LOOK_BACK_TIME = 10     #maximum real time in the past from which training data is extracted; values are in 'hrs' or 'days'
-MAX_LOOK_FORWARD_TIME = 2   #maximum real time in the future from which training data is extracted; values are in 'hrs' or 'days'
-
 TIME_TRAIN_FORMAT_CURR = 'secs'  #the current format in which time is represented; in 'secs' or 'nanosecs'
 MAX_TIME_TRAIN_FORMAT_TO = 'days'    #time format to covert to in 'mins', 'hrs' or 'days'
 
